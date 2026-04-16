@@ -1,111 +1,102 @@
-# Multi-Container Runtime
+Multi-Container Runtime
 
-A lightweight Linux container runtime in C with a long-running supervisor and a kernel-space memory monitor.
+1. Team Information
 
-Read [`project-guide.md`](project-guide.md) for the full project specification.
+Name: shreya mohanty, SRN: PES2UG24CS482
+Name: Satvik phadke, SRN: PES2UG24CS450
+2. Build, Load, and Run Instructions
+Build
 
----
+cd boilerplate make
 
-## Getting Started
+Load kernel module
 
-### 1. Fork the Repository
+sudo insmod monitor.ko ls /dev/container_monitor
 
-1. Go to [github.com/shivangjhalani/OS-Jackfruit](https://github.com/shivangjhalani/OS-Jackfruit)
-2. Click **Fork** (top-right)
-3. Clone your fork:
+Start supervisor (Terminal 1)
 
-```bash
-git clone https://github.com/<your-username>/OS-Jackfruit.git
-cd OS-Jackfruit
-```
+sudo ./engine supervisor ./rootfs
 
-### 2. Set Up Your VM
+Launch containers (Terminal 2)
 
-You need an **Ubuntu 22.04 or 24.04** VM with **Secure Boot OFF**. WSL will not work.
+sudo ./engine start alpha (pwd)/roof fs/rootfs/cpu_hog
 
-Install dependencies:
+List containers
 
-```bash
-sudo apt update
-sudo apt install -y build-essential linux-headers-$(uname -r)
-```
+sudo ./engine ps
 
-### 3. Run the Environment Check
+View logs
 
-```bash
-cd boilerplate
-chmod +x environment-check.sh
-sudo ./environment-check.sh
-```
+sudo ./engine logs alpha
 
-Fix any issues reported before moving on.
+Stop a container
 
-### 4. Prepare the Root Filesystem
+sudo ./engine stop alpha
 
-```bash
-mkdir rootfs-base
-wget https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz
-tar -xzf alpine-minirootfs-3.20.3-x86_64.tar.gz -C rootfs-base
+Stop supervisor
 
-# Make one writable copy per container you plan to run
-cp -a ./rootfs-base ./rootfs-alpha
-cp -a ./rootfs-base ./rootfs-beta
-```
+Press Ctrl+C in Terminal 1
 
-Do not commit `rootfs-base/` or `rootfs-*` directories to your repository.
+Unload module
 
-### 5. Understand the Boilerplate
+sudo rmmod monitor
 
-The `boilerplate/` folder contains starter files:
+Demo Screenshots
 
-| File                   | Purpose                                             |
-| ---------------------- | --------------------------------------------------- |
-| `engine.c`             | User-space runtime and supervisor skeleton          |
-| `monitor.c`            | Kernel module skeleton                              |
-| `monitor_ioctl.h`      | Shared ioctl command definitions                    |
-| `Makefile`             | Build targets for both user-space and kernel module |
-| `cpu_hog.c`            | CPU-bound test workload                             |
-| `io_pulse.c`           | I/O-bound test workload                             |
-| `memory_hog.c`         | Memory-consuming test workload                      |
-| `environment-check.sh` | VM environment preflight check                      |
+Screenshots for all tasks are in the all file section.
 
-Use these as your starting point. You are free to restructure the repository however you want — the submission requirements are listed in the project guide.
+Engineering Analysis
 
-### 6. Build and Verify
+Isolation Mechanisms
 
-```bash
-cd boilerplate
-make
-```
+The runtime uses clone() with CLONE_NEWPID, CLONE_NEWUTS, and CLONE_NEWNS flags to give each container its own PID namespace (so container PIDs start at 1), UTS namespace (its own hostname), and mount namespace (isolated filesystem view). chroot() then locks the process into the Alpine rootfs directory. The host kernel itself is still shared — containers use the same kernel, same system calls, and same physical memory as the host. Only the view of resources is isolated, not the kernel itself. This is fundamentally different from a VM.
 
-If this compiles without errors, your environment is ready.
+Supervisor and Process Lifecycle
 
-### 7. GitHub Actions Smoke Check
+A long-running supervisor is necessary because containers are child processes that must be reaped when they exit. Without a persistent parent, they become zombies. The supervisor uses SIGCHLD with SA_NOCLDSTOP to get notified when any container exits, then calls waitpid(-1, &status, WNOHANG) in a loop to reap all exited children and update their metadata records.
 
-Your fork will inherit a minimal GitHub Actions workflow from this repository.
+IPC, Threads, and Synchronization
 
-That workflow only performs CI-safe checks:
+Two IPC mechanisms are used:
 
-- `make -C boilerplate ci`
-- user-space binary compilation (`engine`, `memory_hog`, `cpu_hog`, `io_pulse`)
-- `./boilerplate/engine` with no arguments must print usage and exit with a non-zero status
+Pipes: between each container and the supervisor for log capture. stdout/stderr of the container are dup2'd into the write end; the supervisor reads from the read end in a producer thread.
+UNIX domain socket: between the CLI client and the supervisor for control commands (start, stop, ps, logs).
+The bounded buffer uses a mutex + two condition variables (not_full, not_empty). Without the mutex, concurrent producer and consumer threads would corrupt the head/tail indices. Without condition variables, threads would busy-wait instead of sleeping, wasting CPU. A semaphore could also work but condition variables allow the shutdown broadcast to wake all waiting threads at once.
 
-The CI-safe build command is:
+Memory Management and Enforcement
 
-```bash
-make -C boilerplate ci
-```
+RSS (Resident Set Size) measures the physical memory actually mapped and present in RAM for a process. It does NOT include swap, shared libraries counted only once, or memory that has been allocated but not yet accessed (lazy allocation). Soft limits trigger a warning so operators can see a container is getting close to its budget without disrupting it. Hard limits kill the process because once it exceeds the budget, continued growth could starve other containers or the host. Enforcement must be in kernel space because a user-space monitor could be fooled or killed by the very process it is watching. The kernel timer fires independently and cannot be bypassed by the container.
 
-This smoke check does not test kernel-module loading, supervisor runtime behavior, or container execution.
+Scheduling Behavior
 
----
+[Fill in with your actual experiment numbers] In Experiment 2, high_prio (nice=0) received approximately 99% CPU while low_prio (nice=19) received approximately 99% CPU when running simultaneously. The Linux CFS (Completely Fair Scheduler) uses nice values to assign virtual runtime weights: nice=19 gives roughly 1/20th the weight of nice=0. This matches the observed CPU share difference. Completion time for nice=0 was 59.262s vs 59.723s for nice=19, confirming that lower priority containers are significantly slower when competing for CPU.
 
-## What to Do Next
+5. Design Decisions and Tradeoffs
 
-Read [`project-guide.md`](project-guide.md) end to end. It contains:
+Namespace Isolation
 
-- The six implementation tasks (multi-container runtime, CLI, logging, kernel monitor, scheduling experiments, cleanup)
-- The engineering analysis you must write
-- The exact submission requirements, including what your `README.md` must contain (screenshots, analysis, design decisions)
+Choice: clone() with CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS Tradeoff: Network namespace (CLONE_NEWNET) is not isolated, so containers share the host network stack. Justification: Network isolation requires veth pairs and bridge setup which is out of scope; PID/UTS/mount isolation is sufficient for the project goals.
 
-Your fork's `README.md` should be replaced with your own project documentation as described in the submission package section of the project guide. (As in get rid of all the above content and replace with your README.md)
+Supervisor Architecture
+
+Choice: Single-threaded event loop with select() for accepting connections. Tradeoff: Cannot handle multiple CLI clients simultaneously. Justification: CLI commands are short-lived and infrequent; a single-threaded loop is simpler and avoids additional synchronization complexity.
+
+IPC / Logging
+
+Choice: UNIX domain socket for control, pipes for log capture, bounded buffer with mutex+condvar for producer-consumer. Tradeoff: Log chunks are limited to LOG_CHUNK_SIZE (4096 bytes); very long lines may be split across two buffer entries. Justification: UNIX sockets are the natural IPC for local supervisor-client communication. The bounded buffer decouples container output speed from log file write speed.
+
+Kernel Monitor
+
+Choice: mutex over spinlock for proc_list protection. Tradeoff: Slightly higher overhead than a spinlock. Justification: The timer callback calls get_task_mm() which can sleep. Spinlocks forbid sleeping in the locked section, so a mutex is required here.
+
+Scheduling Experiments
+
+Choice: nice values via --nice flag rather than CPU affinity. Tradeoff: nice values affect priority but not CPU pinning; on a multi-core machine both processes may run in parallel. Justification: nice values directly demonstrate CFS weight-based scheduling which is the core Linux scheduling concept relevant to this project.
+
+
+
+
+
+
+
+
